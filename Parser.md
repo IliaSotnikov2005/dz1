@@ -21,7 +21,7 @@ type Node interface {
     node()   // sealed marker
 }
 
-type Simplknommand struct {
+type SimpleCommand struct {
     Assigns []Assign
     Args    []Word
 }
@@ -186,4 +186,3 @@ classDiagram
     Pipeline *-- Node
     Assign *-- Word
 ```
-

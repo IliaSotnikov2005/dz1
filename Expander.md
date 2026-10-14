@@ -1,16 +1,34 @@
-## Expander как сервис — идея
+# Expander: место в системе, что делает, как работает
 
-### Что меняется по сравнению с прошлой картинкой
+## Почему один класс
 
-Раньше я рисовал конвейер:
+Да, весь `Expander` — это **один класс** с тремя публичными методами и парой приватных помощников. Это не случайность и не упрощение — это следствие того, **чем** является экспандер.
+
+Экспандер — **чистая функция** от `(Word, Environment)`. У него нет состояния, которое нужно было бы хранить между вызовами. Он не владеет ресурсами, не создаёт процессов, не пишет в потоки. Он получает данные и возвращает данные. Всё, что нужно для работы, приходит **в аргументах**.
+
+Сравни с другими компонентами:
+
+| Компонент     | Состояние между вызовами                                     | Почему           |
+| ------------- | ------------------------------------------------------------ | ---------------- |
+| `Lexer`       | `input`, `pos` — но **сбрасывается** на каждый `Tokenize`    | stateless-сервис |
+| `Parser`      | `tokens`, `pos` — тоже сбрасывается на каждый `Parse`        | stateless-сервис |
+| `Environment` | `vars`, `exported` — **живут** между командами               | stateful         |
+| `Shell`       | `env`, `registry`, `shouldExit` — **живут** между итерациями | stateful         |
+| `Expander`    | —                                                            | **stateless**    |
+
+Из-за statelessness `Expander` не нужно ни клонировать, ни сериализовать, ни синхронизировать. Один экземпляр на весь shell — и он работает для всех команд.
+
+## Место в системе
+
+Соблазн нарисовать конвейер:
 
 ```
 Lexer → Parser → Expander → Executor
 ```
 
-Это создавало ложное впечатление, что экспандер — **фаза** между парсером и executor'ом. На деле это **сервис**, который executor вызывает **по месту** — когда дошёл до конкретного узла AST и ему нужно превратить `Word` в конкретные строки.
+Это **неверно**, потому что создаёт впечатление, что экспандер — **фаза** между парсером и executor'ом. То есть что парсер отдаёт AST экспандеру, тот его полностью раскрывает, а потом отдаёт executor'у уже раскрытый AST.
 
-Правильная картинка:
+На деле:
 
 ```
 Lexer → Parser → AST{Word}
@@ -22,130 +40,306 @@ Lexer → Parser → AST{Word}
                  effects
 ```
 
-Executor — единственный, кто владеет потоком управления. Он обходит AST, и в нужный момент вызывает экспандер как функцию.
+**Executor владеет потоком управления.** Он обходит AST, и **в нужный момент** вызывает экспандер — не один раз на всё дерево, а **по месту**, с разными политиками для разных контекстов.
 
-### Почему это правильнее
+## Почему экспандер — сервис, а не фаза
 
-**1. Разные политики раскрытия в разных контекстах.** Аргументы команды раскрываются одним способом, значение присваивания — другим, аргументы `for` (в будущем) — третьим. Если экспандер — фаза, ты застрянешь с одной политикой на всё дерево. Если сервис — executor сам решает, **что** и **как** раскрывать в каждой точке.
+Четыре причины, каждая из которых ломает фазовую модель.
 
-Пример:
+### Причина 1: разные политики раскрытия
+
+Одна и та же переменная раскрывается **по-разному** в зависимости от контекста:
 
 ```bash
-x=$VAR      # значение присваивания: подстановка БЕЗ split и glob
-echo $VAR   # аргумент: подстановка + split + glob
+VAR="a b c"
+x=$VAR          # значение присваивания: → "a b c" одной строкой
+echo $VAR       # аргумент команды:    → "a", "b", "c" — три аргумента
+echo "$VAR"     # аргумент в кавычках: → "a b c" одним аргументом
 ```
 
-Это два **разных** вызова экспандера с разными флагами.
+Если бы экспандер был фазой, он должен был бы **один раз** пройти по дереву и выбрать одну политику для всех `Word`. Но для `x=$VAR` нужна одна политика, для `echo $VAR` — другая. Значит, политика определяется **не экспандером**, а **executor'ом**, который знает, что перед ним: присваивание или аргумент.
 
-**2. Нет дублирования AST.** В фазовой модели пришлось бы заводить `RawSimpleCommand{Args []Word}` и `ExpandedSimpleCommand{Args []string}` плюс функцию преобразования. В сервисной модели AST один: `SimpleCommand{Args []Word}`, а `[]string` живёт только внутри `execSimple` на время одного вызова.
+### Причина 2: нет дублирования AST
 
-**3. Совпадает с реальными shell'ами.** В Bash `expand_word` — функция, которую вызывает `execute_command`, а не отдельный проход. Это не случайность, а следствие того, что раскрытие контекстно-зависимо.
+Если бы экспандер был фазой, пришлось бы завести **два набора типов**:
 
-**4. Легко расширяется.** Когда появится `$(...)`, экспандеру понадобится вызвать executor для выполнения подкоманды. Если экспандер — фаза, получаем циклическую зависимость `Expander → Executor → Expander`. Если сервис — цикла нет: executor владеет обоими, а экспандер получает executor через параметр.
+```go
+type RawSimpleCommand struct {
+    Args []Word      // до раскрытия
+}
 
-### Что именно делает экспандер
+type ExpandedSimpleCommand struct {
+    Args []string    // после раскрытия
+}
+```
 
-Три публичных метода — по числу политик раскрытия:
+И функцию преобразования `Raw → Expanded`. Это удвоение AST ради того, чтобы разделить две фазы. В сервисной модели AST **один**: `SimpleCommand{Args []Word}`, а `[]string` живёт только внутри `execSimple` на время одного вызова.
+
+### Причина 3: совпадает с реальными shell'ами
+
+В Bash `expand_word` — это **функция**, которую вызывает `execute_command` по месту. Не отдельный проход по дереву. Это не историческая случайность, а следствие того, что раскрытие **контекстно-зависимо**.
+
+### Причина 4: цикл зависимостей при `$(...)`
+
+Когда появится подстановка команд `$(...)`:
+
+```bash
+echo "Today is $(date)"
+```
+
+Экспандеру нужно **выполнить `date`** и подставить её вывод. Для этого ему нужен **executor**. Если экспандер — фаза, получаем цикл:
+
+```
+Expander → Executor → Expander → ...
+```
+
+Если сервис — цикла нет: executor владеет обоими, а экспандер получает executor **через параметр** в момент вызова.
+
+## Почему `Word` и `WordPart`
+
+Экспандер получает **не строки**, а `Word` с сегментами — потому что вся информация о кавычках и раскрытии уже закодирована в `WordPart`. Разберём, что экспандер читает из сегментов:
+
+| Поле `WordPart`     | Что решает экспандер                           |
+| ------------------- | ---------------------------------------------- |
+| `Text`              | что именно подставлять / оставить              |
+| `Quote == UNQUOTED` | применять ли к результату split и glob         |
+| `Quote == SINGLE`   | **не** подставлять `$`, **не** применять split |
+| `Quote == DOUBLE`   | подставлять `$`, но **не** применять split     |
+| `Expandable`        | подставлять ли `$` в этом сегменте             |
+
+Без `WordPart` экспандер видел бы только строку `$VAR` и не смог бы отличить:
+
+```
+$VAR      → Word{[{$VAR, UNQUOTED, true}]}    → подставить + split
+"$VAR"    → Word{[{$VAR, DOUBLE, true}]}      → подставить, без split
+'$VAR'    → Word{[{$VAR, SINGLE, false}]}     → не подставлять
+```
+
+Три разных результата. Строка `$VAR` одинакова во всех трёх случаях. Сегменты — разные.
+
+## Три политики раскрытия
+
+`Expander` предоставляет **три публичных метода**, по одному на каждую политику:
 
 ```go
 type Expander struct {
-    env *Environment
+    // нет полей! stateless
 }
 
 // Аргументы команды: подстановка $ + split + glob
-// Возвращает список готовых строк-аргументов
 func (e *Expander) ExpandArgs(words []Word) []string
 
-// Значение присваивания: подстановка $, но БЕЗ split и glob
-// x=$VAR при VAR="a b" даёт "a b" одной строкой, а не два слова
+// Значение присваивания: подстановка $, БЕЗ split и glob
 func (e *Expander) ExpandAssignValue(w Word) string
 
-// Одно слово в одном аргументе: подстановка $, split, glob
-// Используется, когда нужно раскрыть ровно одно слово
+// Одно слово: подстановка $ + split + glob (используется редко)
 func (e *Expander) ExpandWord(w Word) []string
 ```
 
-Внутри все три используют общий движок:
+Разница между методами — **только в флагах**:
+
+| Метод               | `expandVars` | `split` | `glob`             |
+| ------------------- | ------------ | ------- | ------------------ |
+| `ExpandArgs`        | да           | да      | да (когда добавим) |
+| `ExpandAssignValue` | да           | **нет** | **нет**            |
+| `ExpandWord`        | да           | да      | да                 |
+
+Внутри все три вызывают общий движок:
 
 ```go
-// ядро: пройти по сегментам, подставить $, применить split к unquoted
-func (e *Expander) expandParts(parts []WordPart, split bool) []string
-
-// подстановка $NAME и ${NAME}
-func (e *Expander) expandVars(s string) string
-
-// split по пробелам (в будущем — по IFS)
-func splitFields(s string) []string
-
-// globbing (в минимальной версии не нужен)
-func glob(fields []string) []string
+func (e *Expander) expandParts(parts []WordPart, env *Environment, split bool) []string
 ```
 
-Разница между методами — только в флагах:
+## Как работает `expandParts` — пошагово
 
-| Метод               | expandVars | split   | glob               |
-| ------------------- | ---------- | ------- | ------------------ |
-| `ExpandArgs`        | да         | да      | да (когда добавим) |
-| `ExpandAssignValue` | да         | **нет** | **нет**            |
-| `ExpandWord`        | да         | да      | да                 |
+Это **ядро** экспандера. Разберём его на примере.
 
-### Как это выглядит в executor'е
+### Пример 1: `echo $VAR` где `VAR="a b c"`
 
-Executor обходит AST и в нужных местах вызывает экспандер:
+**Что приходит от парсера:**
 
 ```go
-func (ex *Executor) execSimple(sh *Shell, ctx *ExecContext, c *SimpleCommand) int {
-    // 1. раскрыть присваивания
-    localEnv := ctx.Env.Clone()
-    for _, a := range c.Assigns {
-        val := ex.expander.ExpandAssignValue(a.Value)  // без split
-        localEnv.Set(a.Name, val)
-    }
-
-    // 2. если команды нет — только присваивания в постоянное окружение
-    if len(c.Args) == 0 {
-        for _, a := range c.Assigns {
-            sh.Env.Set(a.Name, ex.expander.ExpandAssignValue(a.Value))
-        }
-        return 0
-    }
-
-    // 3. раскрыть аргументы команды
-    args := ex.expander.ExpandArgs(c.Args)  // с split и glob
-
-    // 4. найти команду: builtin или external
-    name := args[0]
-    if cmd, ok := ex.registry.Get(name); ok {
-        return cmd.Run(sh, ctx.WithEnv(localEnv), args[1:])
-    }
-    return ex.execExternal(ctx.WithEnv(localEnv), args)
+SimpleCommand{
+    Args: []Word{
+        Word{Parts: []WordPart{{Text: "echo", Quote: UNQUOTED, Expandable: true}}},
+        Word{Parts: []WordPart{{Text: "$VAR", Quote: UNQUOTED, Expandable: true}}},
+    },
 }
 ```
 
-Обрати внимание: **executor решает, когда и что раскрывать**. Экспандер только предоставляет функции. Это и есть «сервис».
+**Executor вызывает** `ExpandArgs(args)` для всего списка.
 
-### Где живёт `Environment`
+Для второго слова (`$VAR`) `expandParts` делает:
 
-`Environment` — часть `Shell` (глобальное состояние), но раскрытие происходит в контексте конкретной команды. Поэтому:
+**Шаг 1. Идём по сегментам.** Сегмент один: `{Text: "$VAR", Quote: UNQUOTED, Expandable: true}`.
 
-- `Expander` держит ссылку на **текущее** окружение через `ExecContext`;
-- временные присваивания (`VAR=x cmd`) создают `localEnv` через `Clone()`, и он виден только этой команде;
-- `Expander` не мутирует окружение — он только читает.
+**Шаг 2. `Expandable == true`** → вызываем `expandVars("$VAR", env)`:
 
-Это разделение важно: экспандер **stateless** относительно окружения, он всегда работает с тем `Environment`, который ему передали.
+- находим `$`, читаем имя `VAR`;
+- `env.Get("VAR")` возвращает `"a b c"`;
+- результат: `"a b c"`.
 
-### Что даёт такая модель
+**Шаг 3. `Quote == UNQUOTED`** → применяем `splitFields("a b c")`:
 
-- **Executor — владелец потока управления.** Он один знает порядок: сначала присваивания, потом args, потом поиск команды.
-- **Expander — чистая функция.** Принимает `Word` и окружение, возвращает строки. Легко тестируется.
-- **AST один.** Никаких пар `Raw`/`Expanded` типов.
-- **Расширяемость.** Новый контекст раскрытия = новый метод или новый флаг. Новый синтаксис (`$(...)`, `${VAR:-default}`) = расширение внутри экспандера, не трогая executor.
+- результат: `["a", "b", "c"]`.
 
-## UML-диаграмма
+**Шаг 4. Склеиваем с накопленным результатом.** Так как это первое (и единственное) слово в этом вызове, `result = ["a", "b", "c"]`.
+
+**Итог:** `echo` получит **три аргумента**: `"a"`, `"b"`, `"c"`.
+
+### Пример 2: `echo "$VAR"` где `VAR="a b c"`
+
+**Что приходит:**
+
+```go
+Word{Parts: []WordPart{{Text: "$VAR", Quote: DOUBLE, Expandable: true}}}
+```
+
+**Шаги:**
+
+**Шаг 1.** Сегмент `{Text: "$VAR", Quote: DOUBLE, Expandable: true}`.
+
+**Шаг 2. `Expandable == true`** → `expandVars` → `"a b c"`.
+
+**Шаг 3. `Quote == DOUBLE`** → split **не применяем**. Результат: `["a b c"]` — **один аргумент с пробелами внутри**.
+
+**Итог:** `echo` получит **один аргумент**: `"a b c"`.
+
+### Пример 3: `echo '$VAR'`
+
+**Что приходит:**
+
+```go
+Word{Parts: []WordPart{{Text: "$VAR", Quote: SINGLE, Expandable: false}}}
+```
+
+**Шаги:**
+
+**Шаг 1.** Сегмент `{Text: "$VAR", Quote: SINGLE, Expandable: false}`.
+
+**Шаг 2. `Expandable == false`** → `expandVars` **не вызывается**. Текст остаётся `"$VAR"`.
+
+**Шаг 3. `Quote == SINGLE`** → split не применяем.
+
+**Итог:** `echo` получит **один аргумент**: буквально `"$VAR"`.
+
+### Пример 4: `echo pre$VAR-post` где `VAR="a b"`
+
+**Что приходит:**
+
+```go
+Word{Parts: []WordPart{{Text: "pre$VAR-post", Quote: UNQUOTED, Expandable: true}}}
+```
+
+**Шаги:**
+
+**Шаг 1.** Один сегмент, `Expandable=true`.
+
+**Шаг 2.** `expandVars("pre$VAR-post")`:
+
+- `pre` остаётся;
+- `$VAR` → `"a b"`;
+- `-post` остаётся;
+- результат: `"prea b-post"`.
+
+**Шаг 3. `UNQUOTED`** → `splitFields("prea b-post")`:
+
+- результат: `["prea", "b-post"]`.
+
+**Итог:** `echo` получит **два аргумента**: `"prea"` и `"b-post"`.
+
+### Пример 5: `echo pre"$VAR"post` где `VAR="a b"`
+
+**Что приходит:**
+
+```go
+Word{Parts: []WordPart{
+    {Text: "pre", Quote: UNQUOTED, Expandable: true},
+    {Text: "$VAR", Quote: DOUBLE, Expandable: true},
+    {Text: "post", Quote: UNQUOTED, Expandable: true},
+}}
+```
+
+**Шаги:**
+
+**Шаг 1.** Идём по сегментам слева направо.
+
+**Шаг 2.** Сегмент `pre`:
+
+- `Expandable=true` → `expandVars("pre")` = `"pre"`;
+- `UNQUOTED` → `splitFields("pre")` = `["pre"]`;
+- `result = ["pre"]`.
+
+**Шаг 3.** Сегмент `$VAR`:
+
+- `Expandable=true` → `expandVars("$VAR")` = `"a b"`;
+- `DOUBLE` → split **не применяем**;
+- сегмент **приклеивается к последнему** накопленному полю: `result = ["prea b"]`.
+
+**Шаг 4.** Сегмент `post`:
+
+- `Expandable=true` → `expandVars("post")` = `"post"`;
+- `UNQUOTED` → `splitFields("post")` = `["post"]`;
+- `post` **приклеивается к последнему**: `result = ["prea bpost"]`.
+
+**Итог:** `echo` получит **один аргумент**: `"prea bpost"`.
+
+Обрати внимание: пробел внутри `$VAR` **не разбил** слово, потому что `$VAR` был в `DOUBLE`-кавычках, а `pre` и `post` приклеились к тому же полю.
+
+## Ключевое правило склейки
+
+Когда сегмент разбился на несколько полей через split:
+
+```
+result = ["foo"]            // накоплено от предыдущих сегментов
+fields = ["a", "b", "c"]    // пришло от $VAR (UNQUOTED)
+
+→ result = ["fooa", "b", "c"]
+```
+
+**Первое поле** приклеивается к последнему накопленному, **остальные** становятся новыми полями. Это воспроизводит поведение Bash:
+
+```bash
+VAR="a b c"
+echo pre$VAR post
+# → prea b c post   (четыре аргумента: prea, b, c, post)
+```
+
+А если `VAR` в кавычках:
+
+```bash
+echo pre"$VAR" post
+# → prea b c post   (три аргумента: "prea b c", "post")
+```
+
+Здесь `"$VAR"` не разбивается — целиком приклеивается к `pre` как один сегмент.
+
+## Почему `expandVars` работает на уровне сегмента, а не всего слова
+
+Потому что `Expandable` — свойство **сегмента**, а не слова. В одном слове могут быть сегменты с разным `Expandable`:
+
+```
+'$A'$B'$C'  →  три сегмента:
+                {Text: "$A", Quote: SINGLE, Expandable: false}   ← не подставляем
+                {Text: "$B", Quote: UNQUOTED, Expandable: true}  ← подставляем
+                {Text: "$C", Quote: SINGLE, Expandable: false}   ← не подставляем
+```
+
+Если бы `expandVars` работал на уровне слова, он бы не знал, где подставлять, а где нет. Поэтому `expandParts` идёт **по сегментам**, и для каждого решает отдельно.
+
+## Почему split применяется к сегменту, а не к слову
+
+Та же причина. В слове `pre"$VAR"post` только сегменты `pre` и `post` — `UNQUOTED`. Split применяется **к ним**, а не ко всему слову `prea bpost`. Если бы split применялся ко всему слову, пробел внутри `$VAR` разбил бы `pre` и `post` на три куска, что неверно.
+
+Правильное поведение: split применяется **только к сегментам с `Quote == UNQUOTED`**, и результат **склеивается** с соседними сегментами по правилу «первое поле приклеивается к последнему накопленному».
+
+## UML-диаграмма Expander
+
+Как ты и предполагал — **один класс** плюс типы, которые он читает.
 
 ```mermaid
 classDiagram
-    %% ===================== ДАННЫЕ =====================
+    %% ===================== ВХОДНЫЕ ДАННЫЕ =====================
     class Word {
         +[]WordPart parts
     }
@@ -160,104 +354,51 @@ classDiagram
         SINGLE
         DOUBLE
     }
-
-    %% ===================== AST =====================
-    class Node {
-        <<interface>>
-    }
-    class SimpleCommand {
-        +[]Assign assigns
-        +[]Word args
-    }
-    class Pipeline {
-        +[]Node commands
-    }
-    class Assign {
-        +string name
-        +Word value
-    }
-
-    %% ===================== ОКРУЖЕНИЕ =====================
     class Environment {
-        -map~string,string~ vars
-        +Get(name) string
-        +Set(name, value)
-        +Clone() *Environment
+        +Get(name string) (string, bool)
     }
 
     %% ===================== ЭКСПАНДЕР =====================
     class Expander {
-        +ExpandArgs(words []Word) []string
-        +ExpandWord(w Word) []string
-        +ExpandAssignValue(w Word) string
-        -expandParts(parts []WordPart, split bool) []string
-        -expandVars(s string) string
-    }
-
-    %% ===================== ИСПОЛНЕНИЕ =====================
-    class Shell {
-        +*Environment env
-        +*Registry registry
-    }
-    class ExecContext {
-        +io.Reader stdin
-        +io.Writer stdout
-        +io.Writer stderr
-        +*Environment env
-    }
-    class Executor {
-        +Execute(sh *Shell, ctx *ExecContext, n Node) int
-        -execSimple(sh, ctx, c *SimpleCommand) int
-        -execPipeline(sh, ctx, p *Pipeline) int
-    }
-    class Registry {
-        +Get(name) (Command, bool)
-    }
-    class Command {
-        <<interface>>
-        +Run(sh, ctx, args []string) int
+        +ExpandArgs(words []Word, env *Environment) []string
+        +ExpandAssignValue(w Word, env *Environment) string
+        +ExpandWord(w Word, env *Environment) []string
+        -expandParts(parts []WordPart, env *Environment, split bool) []string
+        -expandVars(s string, env *Environment) string
+        -splitFields(s string) []string
     }
 
     %% ===================== СВЯЗИ =====================
     Word *-- WordPart
     WordPart --> QuoteKind
-
-    Node <|.. SimpleCommand
-    Node <|.. Pipeline
-    SimpleCommand *-- Assign
-    SimpleCommand *-- Word
-    Pipeline *-- Node
-
-    Executor ..> Node : walks
-    Executor ..> Expander : uses
-    Executor ..> Registry : looks up
-    Executor ..> Shell : reads state
-    Executor ..> ExecContext : streams
-
     Expander ..> Word : reads
     Expander ..> WordPart : reads
-    Expander ..> Environment : reads
-
-    Shell *-- Environment
-    Shell *-- Registry
-    ExecContext *-- Environment
-    Registry o-- Command
+    Expander ..> Environment : reads via Get
 ```
 
-## Ключевое отличие от прошлой диаграммы
+**Пояснения:**
 
-- `Expander` теперь соединён с `Executor`, а **не** стоит между `Parser` и `Executor`. Он — зависимость, а не звено цепочки.
-- `Shell` владеет `Environment` и `Registry`, но **не** владеет `Expander`. Expander создаётся один раз и передаётся в executor (или создаётся внутри `Executor`), потому что он stateless.
-- `ExecContext` несёт `Environment` — потому что раскрытие одной команды может видеть временное окружение (`VAR=x cmd`), отличное от глобального.
-- `Pipeline` соединён с `Node` — executor рекурсивно обходит дерево, а не только плоский список.
+- **`Expander` — один класс**, без полей. Все данные приходят в аргументах: `Word` (или `[]Word`) и `Environment`. Это делает его stateless и легко тестируемым.
+- **`ExpandArgs`** — политика для аргументов команды: подстановка + split + glob.
+- **`ExpandAssignValue`** — политика для значения присваивания: подстановка, **без** split и glob.
+- **`ExpandWord`** — политика для одного слова: подстановка + split + glob. Используется редко, но нужна для единообразия.
+- **`expandParts`** — приватное ядро. Идёт по сегментам, для каждого решает: подставлять ли `$` (по `Expandable`), применять ли split (по `Quote`), склеивать ли с накопленным результатом.
+- **`expandVars`** — приватный помощник для подстановки `$NAME` и `${NAME}`.
+- **`splitFields`** — приватный помощник для разбиения по пробелам (в будущем — по `IFS`).
+- **`Expander` не владеет `Environment`.** Он получает его в аргументах и только читает. Это важно: экспандер не мутирует окружение, он **чистая функция**.
 
-## Что дальше
+## Итого
 
-Следующий слой — **executor**. Там разбираются:
+**Почему один класс:** экспандер stateless. Все данные приходят в аргументах, ничего не хранится между вызовами. Один экземпляр на весь shell.
 
-- различие builtin / external;
-- как `SimpleCommand` без `Args` (только `Assigns`) превращается в запись переменных;
-- как `Pipeline` создаёт `os.Pipe()` и запускает команды с правильными `ExecContext`;
-- как `exit` меняет состояние `Shell`.
+**Место в системе:** экспандер — **сервис**, который вызывает `Executor` по месту. Не фаза между парсером и executor'ом. Это позволяет разным контекстам (аргументы, присваивания) использовать разные политики раскрытия.
 
-Если хочешь, разберём его так же — описание + диаграмма, уже с учётом того, что `Expander` — сервис.
+**Почему `Word` и `WordPart`:** потому что вся информация о кавычках и раскрытии закодирована в сегментах. Без них экспандер не смог бы отличить `$VAR` от `"$VAR"` от `'$VAR'` — три разных результата из одинаковой строки.
+
+**Как работает:** идём по сегментам слова. Для каждого:
+
+- если `Expandable` — подставляем `$`;
+- если `UNQUOTED` — применяем split;
+- склеиваем с накопленным результатом по правилу «первое поле приклеивается к последнему».
+
+Три публичных метода — три политики: `ExpandArgs` (со split), `ExpandAssignValue` (без split), `ExpandWord` (со split, для одного слова).
